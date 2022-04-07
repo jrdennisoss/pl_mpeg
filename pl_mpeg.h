@@ -233,6 +233,10 @@ typedef struct {
 typedef void(*plm_video_decode_callback)
 	(plm_t *self, plm_frame_t *frame, void *user);
 
+// Callback function for the video decoder once a picture header has been decoded
+
+typedef void(*plm_video_decode_picture_header_callback)
+	(plm_video_t *self, void *user);
 
 // Decoded Audio Samples
 // Samples are stored as normalized (-1, 1) float either interleaved, or if
@@ -265,6 +269,9 @@ typedef void(*plm_audio_decode_callback)
 
 typedef void(*plm_buffer_load_callback)(plm_buffer_t *self, void *user);
 
+// Callback function for plm_buffer when its requested to seek in virtual file mode
+
+typedef void(*plm_buffer_seek_callback)(plm_buffer_t *self, void *user, size_t pos);
 
 
 // -----------------------------------------------------------------------------
@@ -479,6 +486,11 @@ plm_buffer_t *plm_buffer_create_with_filename(const char *filename);
 
 plm_buffer_t *plm_buffer_create_with_file(FILE *fh, int close_when_done);
 
+// Create a buffer instance operating like a file, but instead using callbacks
+// in place of the FILE API f*() functions.... Pass TRUE to close_when_done
+// to let plmpeg call fclose() on the handle when plm_destroy() is called.
+
+plm_buffer_t *plm_buffer_create_with_virtual_file(plm_buffer_load_callback load_fp, plm_buffer_seek_callback seek_fp, void *user, size_t file_size);
 
 // Create a buffer instance with a pointer to memory as source. This assumes
 // the whole file is in memory. The bytes are not copied. Pass 1 to 
@@ -705,6 +717,11 @@ int plm_video_has_ended(plm_video_t *self);
 plm_frame_t *plm_video_decode(plm_video_t *self);
 
 
+// Set a callback that is called whenever a picture header is decoded
+
+void plm_video_set_decode_picture_header_callback(plm_video_t *self, plm_video_decode_picture_header_callback fp, void *user);
+
+
 // Convert the YCrCb data of a frame into interleaved R G B data. The stride
 // specifies the width in bytes of the destination buffer. I.e. the number of
 // bytes from one line to the next. The stride must be at least 
@@ -878,29 +895,21 @@ int plm_init_decoders(plm_t *self) {
 		return FALSE;
 	}
 
-	if (plm_demux_get_num_video_streams(self->demux) > 0) {
-		if (self->video_enabled) {
-			self->video_packet_type = PLM_DEMUX_PACKET_VIDEO_1;
-		}
-		self->video_buffer = plm_buffer_create_with_capacity(PLM_BUFFER_DEFAULT_SIZE);
-		plm_buffer_set_load_callback(self->video_buffer, plm_read_video_packet, self);
+	//always allocate a video decoder regardless how many streams are declared in the MPEG system header
+	if (self->video_enabled) {
+		self->video_packet_type = PLM_DEMUX_PACKET_VIDEO_1;
 	}
+	self->video_buffer = plm_buffer_create_with_capacity(PLM_BUFFER_DEFAULT_SIZE);
+	plm_buffer_set_load_callback(self->video_buffer, plm_read_video_packet, self);
+	self->video_decoder = plm_video_create_with_buffer(self->video_buffer, TRUE);
 
-	if (plm_demux_get_num_audio_streams(self->demux) > 0) {
-		if (self->audio_enabled) {
-			self->audio_packet_type = PLM_DEMUX_PACKET_AUDIO_1 + self->audio_stream_index;
-		}
-		self->audio_buffer = plm_buffer_create_with_capacity(PLM_BUFFER_DEFAULT_SIZE);
-		plm_buffer_set_load_callback(self->audio_buffer, plm_read_audio_packet, self);
+	//always allocate an audio decoder regardless how many streams are declared in the MPEG system header
+	if (self->audio_enabled) {
+		self->audio_packet_type = PLM_DEMUX_PACKET_AUDIO_1 + self->audio_stream_index;
 	}
-
-	if (self->video_buffer) {
-		self->video_decoder = plm_video_create_with_buffer(self->video_buffer, TRUE);
-	}
-
-	if (self->audio_buffer) {
-		self->audio_decoder = plm_audio_create_with_buffer(self->audio_buffer, TRUE);
-	}
+	self->audio_buffer = plm_buffer_create_with_capacity(PLM_BUFFER_DEFAULT_SIZE);
+	plm_buffer_set_load_callback(self->audio_buffer, plm_read_audio_packet, self);
+	self->audio_decoder = plm_audio_create_with_buffer(self->audio_buffer, TRUE);
 
 	self->has_decoders = TRUE;
 	return TRUE;
@@ -1310,7 +1319,7 @@ int plm_seek(plm_t *self, double time, int seek_exact) {
 // plm_buffer implementation
 
 enum plm_buffer_mode {
-	PLM_BUFFER_MODE_FILE,
+	PLM_BUFFER_MODE_FILE, //if seek_callback != NULL then mode is virtual file...
 	PLM_BUFFER_MODE_FIXED_MEM,
 	PLM_BUFFER_MODE_RING,
 	PLM_BUFFER_MODE_APPEND
@@ -1321,12 +1330,14 @@ typedef struct plm_buffer_t {
 	size_t capacity;
 	size_t length;
 	size_t total_size;
+	size_t file_pos;
 	int discard_read_bytes;
 	int has_ended;
 	int free_when_done;
 	int close_when_done;
 	FILE *fh;
 	plm_buffer_load_callback load_callback;
+	plm_buffer_seek_callback seek_callback; //not NULL when in "virtual file" mode...
 	void *load_callback_user_data;
 	uint8_t *bytes;
 	enum plm_buffer_mode mode;
@@ -1379,6 +1390,16 @@ plm_buffer_t *plm_buffer_create_with_file(FILE *fh, int close_when_done) {
 	fseek(self->fh, 0, SEEK_SET);
 
 	plm_buffer_set_load_callback(self, plm_buffer_load_file_callback, NULL);
+	return self;
+}
+
+plm_buffer_t *plm_buffer_create_with_virtual_file(plm_buffer_load_callback load_fp, plm_buffer_seek_callback seek_fp, void *user, size_t file_size) {
+	plm_buffer_t *self = plm_buffer_create_with_capacity(PLM_BUFFER_DEFAULT_SIZE);
+	self->mode = PLM_BUFFER_MODE_FILE;
+	self->discard_read_bytes = TRUE;
+	self->total_size = file_size;
+	plm_buffer_set_load_callback(self, load_fp, user);
+	self->seek_callback = seek_fp; //setting this to non-NULL makes it a virtual file
 	return self;
 }
 
@@ -1483,9 +1504,13 @@ void plm_buffer_seek(plm_buffer_t *self, size_t pos) {
 	self->has_ended = FALSE;
 
 	if (self->mode == PLM_BUFFER_MODE_FILE) {
-		fseek(self->fh, pos, SEEK_SET);
+		if (self->seek_callback)
+			(*self->seek_callback)(self, self->load_callback_user_data, pos);
+		else
+			fseek(self->fh, pos, SEEK_SET);
 		self->bit_index = 0;
 		self->length = 0;
+		self->file_pos = pos;
 	}
 	else if (self->mode == PLM_BUFFER_MODE_RING) {
 		if (pos != 0) {
@@ -1503,13 +1528,13 @@ void plm_buffer_seek(plm_buffer_t *self, size_t pos) {
 
 size_t plm_buffer_tell(plm_buffer_t *self) {
 	return self->mode == PLM_BUFFER_MODE_FILE
-		? ftell(self->fh) + (self->bit_index >> 3) - self->length
+		? self->file_pos + (self->bit_index >> 3)
 		: self->bit_index >> 3;
 }
 
 void plm_buffer_discard_read_bytes(plm_buffer_t *self) {
 	size_t byte_pos = self->bit_index >> 3;
-	if (byte_pos == self->length) {
+	if (byte_pos >= self->length) {
 		self->bit_index = 0;
 		self->length = 0;
 	}
@@ -1518,6 +1543,7 @@ void plm_buffer_discard_read_bytes(plm_buffer_t *self) {
 		self->bit_index -= byte_pos << 3;
 		self->length -= byte_pos;
 	}
+	self->file_pos += byte_pos;
 }
 
 void plm_buffer_load_file_callback(plm_buffer_t *self, void *user) {
@@ -2561,12 +2587,16 @@ typedef struct plm_video_t {
 	int chroma_height;
 
 	int start_code;
+	int picture_temporal_reference;
 	int picture_type;
+	int picture_extension_count;
+	int picture_user_data_count;
 
 	plm_video_motion_t motion_forward;
 	plm_video_motion_t motion_backward;
 
 	int has_sequence_header;
+	int seqh_picture_rate;
 
 	int quantizer_scale;
 	int slice_begin;
@@ -2595,6 +2625,9 @@ typedef struct plm_video_t {
 
 	int has_reference_frame;
 	int assume_no_b_frames;
+
+	plm_video_decode_picture_header_callback decode_picture_header_callback;
+	void *decode_picture_header_callback_user_data;
 } plm_video_t;
 
 static inline uint8_t plm_clamp(int n) {
@@ -2746,6 +2779,7 @@ plm_frame_t *plm_video_decode(plm_video_t *self) {
 			frame = &self->frame_forward;
 		}
 		else {
+			if (self->frames_decoded == 0) frame = &self->frame_backward; //to capture first i picture
 			self->has_reference_frame = TRUE;
 		}
 	} while (!frame);
@@ -2755,6 +2789,11 @@ plm_frame_t *plm_video_decode(plm_video_t *self) {
 	self->time = (double)self->frames_decoded / self->framerate;
 	
 	return frame;
+}
+
+void plm_video_set_decode_picture_header_callback(plm_video_t *self, plm_video_decode_picture_header_callback fp, void *user) {
+	self->decode_picture_header_callback = fp;
+	self->decode_picture_header_callback_user_data = user;
 }
 
 int plm_video_has_header(plm_video_t *self) {
@@ -2792,7 +2831,8 @@ int plm_video_decode_sequence_header(plm_video_t *self) {
 	// Skip pixel aspect ratio
 	plm_buffer_skip(self->buffer, 4);
 
-	self->framerate = PLM_VIDEO_PICTURE_RATE[plm_buffer_read(self->buffer, 4)];
+	self->seqh_picture_rate = plm_buffer_read(self->buffer, 4);
+	self->framerate = PLM_VIDEO_PICTURE_RATE[self->seqh_picture_rate];
 
 	// Skip bit_rate, marker, buffer_size and constrained bit
 	plm_buffer_skip(self->buffer, 18 + 1 + 10 + 1);
@@ -2864,9 +2904,11 @@ void plm_video_init_frame(plm_video_t *self, plm_frame_t *frame, uint8_t *base) 
 }
 
 void plm_video_decode_picture(plm_video_t *self) {
-	plm_buffer_skip(self->buffer, 10); // skip temporalReference
+	self->picture_temporal_reference = plm_buffer_read(self->buffer, 10);
 	self->picture_type = plm_buffer_read(self->buffer, 3);
 	plm_buffer_skip(self->buffer, 16); // skip vbv_delay
+	self->picture_extension_count = 0;
+	self->picture_user_data_count = 0;
 
 	// D frames or unknown coding type
 	if (self->picture_type <= 0 || self->picture_type > PLM_VIDEO_PICTURE_TYPE_B) {
@@ -2910,10 +2952,20 @@ void plm_video_decode_picture(plm_video_t *self) {
 	// Find first slice start code; skip extension and user data
 	do {
 		self->start_code = plm_buffer_next_start_code(self->buffer);
+		switch(self->start_code) {
+		case PLM_START_EXTENSION: ++self->picture_extension_count; break;
+		case PLM_START_USER_DATA: ++self->picture_user_data_count; break;
+		}
 	} while (
 		self->start_code == PLM_START_EXTENSION || 
 		self->start_code == PLM_START_USER_DATA
 	);
+
+	// Call the decode picture header callback if it needs to make
+	// any modifications before slice decoding...
+	if (self->decode_picture_header_callback) {
+		(*self->decode_picture_header_callback)(self, self->decode_picture_header_callback_user_data);
+	}
 
 	// Decode all slices
 	while (PLM_START_IS_SLICE(self->start_code)) {
@@ -3610,10 +3662,10 @@ static const uint8_t PLM_AUDIO_QUANT_LUT_STEP_1[2][16] = {
 };
 
 // Quantizer lookup, step 2: bitrate class, sample rate -> B2 table idx, sblimit
-static const uint8_t PLM_AUDIO_QUANT_TAB_A = (27 | 64);   // Table 3-B.2a: high-rate, sblimit = 27
-static const uint8_t PLM_AUDIO_QUANT_TAB_B = (30 | 64);   // Table 3-B.2b: high-rate, sblimit = 30
-static const uint8_t PLM_AUDIO_QUANT_TAB_C = 8;           // Table 3-B.2c:  low-rate, sblimit =  8
-static const uint8_t PLM_AUDIO_QUANT_TAB_D = 12;          // Table 3-B.2d:  low-rate, sblimit = 12
+#define PLM_AUDIO_QUANT_TAB_A (27 | 64)   // Table 3-B.2a: high-rate, sblimit = 27
+#define PLM_AUDIO_QUANT_TAB_B (30 | 64)   // Table 3-B.2b: high-rate, sblimit = 30
+#define PLM_AUDIO_QUANT_TAB_C (8)           // Table 3-B.2c:  low-rate, sblimit =  8
+#define PLM_AUDIO_QUANT_TAB_D (12)          // Table 3-B.2d:  low-rate, sblimit = 12
 
 static const uint8_t QUANT_LUT_STEP_2[3][3] = {
 	//44.1 kHz,              48 kHz,                32 kHz
@@ -3816,16 +3868,15 @@ int plm_audio_find_frame_sync(plm_audio_t *self) {
 			return TRUE;
 		}
 	}
-	self->buffer->bit_index = (i + 1) << 3;
+	self->buffer->bit_index = self->buffer->length << 3;
 	return FALSE;
 }
 
 int plm_audio_decode_header(plm_audio_t *self) {
+	plm_buffer_skip_bytes(self->buffer, 0x00);
 	if (!plm_buffer_has(self->buffer, 48)) {
 		return 0;
 	}
-
-	plm_buffer_skip_bytes(self->buffer, 0x00);
 	int sync = plm_buffer_read(self->buffer, 11);
 
 
